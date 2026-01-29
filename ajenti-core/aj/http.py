@@ -12,6 +12,12 @@ from io import BytesIO
 import pickle
 import logging
 from urllib.parse import unquote
+import tempfile
+from urllib.parse import parse_qs
+from email import message_from_binary_file
+from email.parser import BytesParser
+
+
 
 from aj.api.http import BaseHttpHandler
 import aj
@@ -84,16 +90,173 @@ class HttpMiddlewareAggregator(BaseHttpHandler):
             if output is not None:
                 return output
 
-class CGIFieldStorage(cgi.FieldStorage):
-    # Fix cgi bug when a put request does not have a content-disposition
-    # See https://github.com/python/cpython/issues/71964
-    # TODO : cgi module will be deprecated in Python 3.11
+# class CGIFieldStorage(cgi.FieldStorage):
+#     # Fix cgi bug when a put request does not have a content-disposition
+#     # See https://github.com/python/cpython/issues/71964
+#     # TODO : cgi module will be deprecated in Python 3.11
+#
+#     def make_file(self, binary=None):
+#         """
+#         Always open a tempfile as binary
+#         """
+#         return tempfile.TemporaryFile("wb+")
+
+class CGIFieldStorage:
+    """
+    Replacement for cgi.FieldStorage for handling form data and file uploads.
+    Compatible with Python 3.13+
+    """
+
+    def __init__(self, fp=None, headers=None, environ=None):
+        self.file = fp
+        self.headers = headers or {}
+        self.environ = environ or {}
+        self.list = []
+        self.type = None
+        self.type_options = {}
+
+        if headers:
+            content_type = headers.get('Content-Type', '')
+            if content_type:
+                self._parse_content_type(content_type)
+
+        if fp:
+            self._parse_data(fp)
+
+    def _parse_content_type(self, content_type):
+        """Parse content type header"""
+        from email.message import EmailMessage
+        msg = EmailMessage()
+        msg['content-type'] = content_type
+        self.type = msg.get_content_type()
+        # Get parameters like boundary
+        if hasattr(msg['content-type'], 'params'):
+            self.type_options = dict(msg['content-type'].params)
+
+    def _parse_data(self, fp):
+        """Parse the form data"""
+        if self.type == 'multipart/form-data':
+            self._parse_multipart(fp)
+        elif self.type == 'application/x-www-form-urlencoded':
+            self._parse_urlencoded(fp)
+
+    def _parse_multipart(self, fp):
+        """Parse multipart form data"""
+        boundary = self.type_options.get('boundary', '').encode()
+        if not boundary:
+            return
+
+        # Read and parse multipart data
+        data = fp.read()
+        parts = data.split(b'--' + boundary)
+
+        for part in parts[1:-1]:  # Skip first empty and last closing boundary
+            if not part.strip():
+                continue
+
+            # Split headers and body
+            header_end = part.find(b'\r\n\r\n')
+            if header_end == -1:
+                header_end = part.find(b'\n\n')
+                if header_end == -1:
+                    continue
+
+            header_data = part[:header_end]
+            body_data = part[header_end + 4:].rstrip(b'\r\n')
+
+            # Parse headers
+            parser = BytesParser()
+            headers = parser.parsebytes(header_data + b'\r\n\r\n')
+
+            # Create field item
+            item = FieldItem()
+            item.headers = dict(headers.items())
+
+            # Parse Content-Disposition
+            content_disp = headers.get('Content-Disposition', '')
+            if content_disp:
+                item.name = self._get_disposition_name(content_disp)
+                item.filename = self._get_disposition_filename(content_disp)
+
+            if item.filename:
+                # File upload
+                item.file = self.make_file()
+                item.file.write(body_data)
+                item.file.seek(0)
+            else:
+                # Regular field
+                item.value = body_data.decode('utf-8', errors='replace')
+
+            self.list.append(item)
+
+    def _parse_urlencoded(self, fp):
+        """Parse URL-encoded form data"""
+        data = fp.read()
+        if isinstance(data, bytes):
+            data = data.decode('utf-8', errors='replace')
+
+        parsed = parse_qs(data, keep_blank_values=True)
+
+        for name, values in parsed.items():
+            for value in values:
+                item = FieldItem()
+                item.name = name
+                item.value = value
+                self.list.append(item)
+
+    def _get_disposition_name(self, disposition):
+        """Extract name from Content-Disposition header"""
+        from email.message import EmailMessage
+        msg = EmailMessage()
+        msg['content-disposition'] = disposition
+        params = dict(msg['content-disposition'].params) if hasattr(msg['content-disposition'], 'params') else {}
+        return params.get('name', '')
+
+    def _get_disposition_filename(self, disposition):
+        """Extract filename from Content-Disposition header"""
+        from email.message import EmailMessage
+        msg = EmailMessage()
+        msg['content-disposition'] = disposition
+        params = dict(msg['content-disposition'].params) if hasattr(msg['content-disposition'], 'params') else {}
+        return params.get('filename', '')
 
     def make_file(self, binary=None):
         """
         Always open a tempfile as binary
+        Fix for PUT requests without content-disposition
         """
         return tempfile.TemporaryFile("wb+")
+
+    def __getitem__(self, key):
+        """Get field by name"""
+        for item in self.list:
+            if item.name == key:
+                return item
+        raise KeyError(key)
+
+    def getvalue(self, key, default=None):
+        """Get value of a field"""
+        try:
+            item = self[key]
+            return item.value if hasattr(item, 'value') else default
+        except KeyError:
+            return default
+
+    def getlist(self, key):
+        """Get all values for a field name"""
+        return [item.value for item in self.list if item.name == key and hasattr(item, 'value')]
+
+
+class FieldItem:
+    """Represents a single form field or file upload"""
+
+    def __init__(self):
+        self.name = None
+        self.value = None
+        self.filename = None
+        self.file = None
+        self.headers = {}
+
 
 class HttpContext():
     """
