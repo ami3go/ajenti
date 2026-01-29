@@ -1,12 +1,19 @@
 [Unit]
-Description=Ajenti panel
-After=network.target
+Description=Ajenti Web Administration Panel
+Documentation=https://github.com/ajenti/ajenti
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
-Type=forking
-PIDFile=/var/run/ajenti.pid
-ExecStart=/usr/bin/python3 /usr/local/bin/ajenti-panel -d
-ExecStartPost=/bin/sleep 5
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/ajenti-panel
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=60
+TimeoutStopSec=30
+# Security hardening
+PrivateTmp=true
+
 
 [Install]
 WantedBy=multi-user.target
